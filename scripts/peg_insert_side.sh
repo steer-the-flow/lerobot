@@ -7,7 +7,7 @@
 #SBATCH --output=/ocean/projects/cis260117p/shared/logs/peg-sft_%j.out
 #SBATCH --error=/ocean/projects/cis260117p/shared/logs/peg-sft_%j.err
 
-module load cuda/12.4.0
+module load cuda/12.6.1
 
 REPO=/ocean/projects/cis260117p/$USER/lerobot
 OCEAN=/ocean/projects/cis260117p/shared
@@ -16,7 +16,8 @@ export HF_LEROBOT_HOME=$OCEAN/data
 export HF_HOME=$OCEAN/hf_cache
 export WANDB_DIR=$OCEAN/wandb
 
-source $REPO/.venv/bin/activate
+module load anaconda
+conda activate recap
 cd $REPO
 
 lerobot-train \
