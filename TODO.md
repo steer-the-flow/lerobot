@@ -5,16 +5,58 @@
 ## Setup
 
 ```bash
-uv venv --python 3.12 .venv
-source .venv/bin/activate
-
-uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-uv pip install -e ".[smolvla,libero,metaworld]"
-
-huggingface-cli login
+module load anaconda
+conda activate rlt
+cd /ocean/projects/cis260117p/$USER/lerobot
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+pip install -e ".[smolvla,libero,metaworld]"
+hf auth login
 wandb login
+echo 'export HF_LEROBOT_HOME=/ocean/projects/cis260117p/shared/data' >> ~/.bashrc
+```
 
-export HF_LEROBOT_HOME=<PATH TO DATA FOLDER>
+
+---
+
+## Debugging on PSC (interactive session)
+
+Get a GPU node interactively:
+```bash
+interact -p GPU-shared --gres=gpu:v100-32:1 -t 1:00:00 -A cis260117p
+```
+
+Once on the node:
+```bash
+module load anaconda
+conda activate rlt
+cd /ocean/projects/cis260117p/$USER/lerobot
+export HF_LEROBOT_HOME=/ocean/projects/cis260117p/shared/data
+
+# verify GPU
+python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+
+# verify model loads
+python -c "
+from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+policy = SmolVLAPolicy(SmolVLAConfig())
+print('OK')
+"
+
+lerobot-train \
+  --policy.type=smolvla \
+  --policy.load_vlm_weights=true \
+  --policy.train_expert_only=true \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=lerobot/metaworld_mt50 \
+  --dataset.episodes="[1750,1751,1752]" \
+  --batch_size=4 \
+  --steps=10 \
+  --log_freq=1 \
+  --save_freq=10 \
+  --output_dir=/ocean/projects/cis260117p/shared/checkpoints/debug_run \
+  --wandb.enable=false \
+  --job_name=debug
 ```
 
 ---
@@ -86,17 +128,13 @@ lerobot-train \
 Eval:
 ```bash
 MUJOCO_GL=osmesa lerobot-eval \
-  --policy.path=./checkpoints/peg_sft/checkpoints/020000/pretrained_model \
+  --policy.path=/ocean/projects/cis260117p/shared/checkpoints/peg-sft/checkpoints/010000/pretrained_model \
   --env.type=metaworld \
-  --env.task_name=peg-insert-side-v3 \
-  --eval.n_episodes=50 \
+  --env.task=peg-insert-side-v3 \
+  --eval.n_episodes=10 \
   --eval.batch_size=2 \
   --policy.device=cuda \
-  --output_dir=./eval_results/peg_sft \
-  --wandb.enable=true \
-  --wandb.entity=idl_34 \
-  --wandb.project=rlt-smolvla \
-  --job_name=eval-peg-sft
+  --output_dir=/ocean/projects/cis260117p/shared/eval_results/peg-sft-10k
 ```
 
 ---

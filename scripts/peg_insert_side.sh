@@ -3,11 +3,9 @@
 #SBATCH --partition=GPU-shared
 #SBATCH --account=cis260117p
 #SBATCH --gres=gpu:v100-32:1
-#SBATCH --time=08:00:00
+#SBATCH --time=20:00:00
 #SBATCH --output=/ocean/projects/cis260117p/shared/logs/peg-sft_%j.out
 #SBATCH --error=/ocean/projects/cis260117p/shared/logs/peg-sft_%j.err
-
-module load cuda/12.6.1
 
 REPO=/ocean/projects/cis260117p/$USER/lerobot
 OCEAN=/ocean/projects/cis260117p/shared
@@ -16,8 +14,8 @@ export HF_LEROBOT_HOME=$OCEAN/data
 export HF_HOME=$OCEAN/hf_cache
 export WANDB_DIR=$OCEAN/wandb
 
-module load anaconda
-conda activate recap
+module load anaconda3
+conda activate rlt
 cd $REPO
 
 lerobot-train \
