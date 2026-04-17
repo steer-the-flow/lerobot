@@ -145,6 +145,23 @@ class SmolVLAConfig(PreTrainedConfig):
     # Dropout probability used throughout the RLT.
     rlt_dropout: float = 0.1
 
+    # -----------------------------------------------------------------
+    # RECAP (advantage-conditioned policy fine-tuning)
+    # RECAP and RLT are mutually exclusive; see __post_init__ assertion.
+    # The advantage token is appended to the prefix stream (alongside image,
+    # language, and state tokens) so the action expert can cross-attend to it.
+    # -----------------------------------------------------------------
+
+    # Master switch. When True, a learnable nn.Embedding(2, vlm_hidden_size)
+    # is added to the action expert and the advantage token is appended to the
+    # prefix sequence on every forward pass.
+    use_advantage_conditioning: bool = False
+
+    # Default advantage label used at inference when no label is provided in
+    # the batch. 1 = A_pos (steer toward success). Keep at 1 for all RECAP
+    # inference; set to 0 only for the A_neg ablation experiment.
+    recap_inference_advantage: int = 1
+
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
@@ -160,6 +177,11 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
+            )
+        if self.use_advantage_conditioning and self.use_transformer_rlt:
+            raise ValueError(
+                "use_advantage_conditioning and use_transformer_rlt cannot both be True. "
+                "RECAP and RLT are independent research tracks; enable one at a time."
             )
 
     def validate_features(self) -> None:
