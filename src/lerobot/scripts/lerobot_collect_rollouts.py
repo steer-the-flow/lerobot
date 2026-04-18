@@ -45,9 +45,12 @@ import numpy as np
 import torch
 from tqdm import trange
 
+from lerobot import envs, policies  # noqa: F401
 from lerobot.configs import parser
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
+from lerobot.envs import EnvConfig
 from lerobot.envs.utils import add_envs_task, preprocess_observation
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
@@ -65,8 +68,8 @@ class CollectRolloutsConfig:
     same checkpoint path / env settings can be copy-pasted from the eval command.
     """
 
-    env: "lerobot.envs.EnvConfig"
-    policy: "lerobot.configs.policies.PreTrainedConfig | None" = None
+    env: EnvConfig
+    policy: PreTrainedConfig | None = None
 
     # Where to write the output LeRobotDataset.
     output_repo_id: str = "./data/recap_rollouts"
@@ -86,7 +89,7 @@ class CollectRolloutsConfig:
         policy_path = parser.get_path_arg("policy")
         if policy_path:
             cli_overrides = parser.get_cli_overrides("policy")
-            self.policy = type(self).policy.__class__.from_pretrained(
+            self.policy = PreTrainedConfig.from_pretrained(
                 policy_path, cli_overrides=cli_overrides
             )
             self.policy.pretrained_path = Path(policy_path)
