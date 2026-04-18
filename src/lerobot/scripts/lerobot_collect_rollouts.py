@@ -330,30 +330,31 @@ def main(cfg: CollectRolloutsConfig):
         env_cfg=cfg.env, policy_cfg=cfg.policy
     )
 
-    # Determine action dimension from the policy config.
-    action_dim = getattr(cfg.policy, "max_action_dim", 7)
+    # Flatten the nested envs dict {suite: {task_id: vec_env}} into a list of vec_envs.
+    flat_envs = [(tg, tid, vec) for tg, group in envs.items() for tid, vec in group.items()]
+    n_tasks = len(flat_envs)
+    eps_per_task = max(1, cfg.n_episodes // n_tasks)
 
-    # Create the output dataset.
-    # Feature schema: images as (H, W, C) uint8, state as float32, action as float32,
-    # advantage_label as int64 (1,). We'll get the exact image shape from the env.
-    # For LIBERO default: observation height/width = 256.
-    obs_height = getattr(cfg.env, "observation_height", 256)
-    obs_width = getattr(cfg.env, "observation_width", 256)
+    # Infer feature schema from the first individual env's observation/action spaces.
+    first_env = flat_envs[0][2]
+    action_dim = first_env.single_action_space.shape[0]
 
-    # Build a minimal feature schema.  Image keys are derived from camera names in
-    # the env config; we use the LIBERO defaults here.  If your env has different
-    # cameras, update camera_keys accordingly.
-    camera_keys_map = {
-        "agentview_image": f"{OBS_IMAGES}.image",
-        "robot0_eye_in_hand_image": f"{OBS_IMAGES}.image2",
-    }
-    camera_output_keys = list(camera_keys_map.values())
+    # Get image shape from the env's observation space (before LiberoProcessorStep).
+    # LiberoProcessorStep flips images but doesn't resize, so shape is unchanged.
+    obs_space = first_env.single_observation_space
+    obs_height = cfg.env.observation_height
+    obs_width = cfg.env.observation_width
+    # Try to get actual image size from obs_space if available.
+    for key in obs_space.spaces if hasattr(obs_space, "spaces") else {}:
+        if "image" in key or "agentview" in key or "eye_in_hand" in key:
+            obs_height, obs_width = obs_space[key].shape[:2]
+            break
 
     # State dim: eef_pos(3) + axis_angle(3) + gripper_qpos(2) = 8 for LIBERO.
-    state_dim = getattr(cfg.policy, "state_feature_dim", 8)
+    state_dim = 8
 
     features = {}
-    for cam_key in camera_output_keys:
+    for cam_key in [f"{OBS_IMAGES}.image", f"{OBS_IMAGES}.image2"]:
         features[cam_key] = {
             "dtype": "image",
             "shape": (obs_height, obs_width, 3),
@@ -381,13 +382,8 @@ def main(cfg: CollectRolloutsConfig):
         fps=fps,
         features=features,
         root=output_dir,
-        use_videos=False,  # save as PNG frames; easier to inspect
+        use_videos=False,
     )
-
-    # Flatten the nested envs dict {suite: {task_id: vec_env}} into a list of vec_envs.
-    flat_envs = [(tg, tid, vec) for tg, group in envs.items() for tid, vec in group.items()]
-    n_tasks = len(flat_envs)
-    eps_per_task = max(1, cfg.n_episodes // n_tasks)
 
     logging.info("Collecting %d episodes across %d tasks → %s", cfg.n_episodes, n_tasks, output_dir)
 
