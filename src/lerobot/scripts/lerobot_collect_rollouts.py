@@ -217,7 +217,8 @@ def collect_episodes(
 
             # 2. Add task string from env.
             obs_with_task = add_envs_task(env, deepcopy(obs_tensor))
-            task_str = obs_with_task.get("task", "")
+            task_val = obs_with_task.get("task", "")
+            task_str = task_val[0] if isinstance(task_val, (list, tuple)) else task_val
 
             # 3. Env-specific preprocessing (LiberoProcessorStep: flip imgs, build state vec).
             obs_env = env_preprocessor(obs_with_task)
