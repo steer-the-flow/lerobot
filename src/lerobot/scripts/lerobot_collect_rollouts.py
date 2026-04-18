@@ -344,8 +344,9 @@ def main(cfg: CollectRolloutsConfig):
     obs_height, obs_width = 256, 256  # fallback
     if hasattr(obs_space, "spaces"):
         for key, space in obs_space.spaces.items():
-            if hasattr(space, "shape") and len(space.shape) == 3:
-                obs_height, obs_width = space.shape[0], space.shape[1]
+            shape = getattr(space, "shape", None)
+            if shape is not None and len(shape) == 3:
+                obs_height, obs_width = shape[0], shape[1]
                 break
 
     # State dim: eef_pos(3) + axis_angle(3) + gripper_qpos(2) = 8 for LIBERO.
