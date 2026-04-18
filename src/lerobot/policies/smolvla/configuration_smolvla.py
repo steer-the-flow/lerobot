@@ -128,7 +128,7 @@ class SmolVLAConfig(PreTrainedConfig):
     # Internal dimension of the RLT transformer. Can be smaller than the VLM
     # hidden size (e.g. 512 vs 2048) to keep the RLT lightweight.
     # Must be divisible by rlt_nhead.
-    rlt_d_model: int = 512
+    rlt_d_model: int = 2048
 
     # Number of attention heads in every RLT encoder/decoder layer.
     rlt_nhead: int = 8
