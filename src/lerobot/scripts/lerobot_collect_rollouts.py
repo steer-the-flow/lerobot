@@ -85,6 +85,10 @@ class CollectRolloutsConfig:
     seed: int = 0
     use_amp: bool = False
 
+    # Optional camera rename map: env feature name → policy feature name.
+    # e.g. '{"observation.images.wrist_image": "observation.images.image2"}'
+    rename_map: dict | None = None
+
     def __post_init__(self) -> None:
         policy_path = parser.get_path_arg("policy")
         if policy_path:
@@ -310,7 +314,7 @@ def main(cfg: CollectRolloutsConfig):
 
     # Load policy.
     logging.info("Loading policy from: %s", cfg.policy.pretrained_path)
-    policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env)
+    policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env, rename_map=cfg.rename_map)
     policy.eval()
 
     preprocessor_overrides = {
