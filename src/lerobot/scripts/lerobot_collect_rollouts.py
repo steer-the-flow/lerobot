@@ -329,8 +329,8 @@ def main(cfg: CollectRolloutsConfig):
         env_cfg=cfg.env, policy_cfg=cfg.policy
     )
 
-    # Determine action dimension from the env's action space.
-    action_dim = envs.single_action_space.shape[0]
+    # Determine action dimension from the policy config.
+    action_dim = getattr(cfg.policy, "max_action_dim", 7)
 
     # Create the output dataset.
     # Feature schema: images as (H, W, C) uint8, state as float32, action as float32,
