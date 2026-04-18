@@ -319,6 +319,7 @@ def main(cfg: CollectRolloutsConfig):
 
     preprocessor_overrides = {
         "device_processor": {"device": str(policy.config.device)},
+        "rename_observations_processor": {"rename_map": cfg.rename_map},
     }
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -383,32 +384,48 @@ def main(cfg: CollectRolloutsConfig):
         use_videos=False,  # save as PNG frames; easier to inspect
     )
 
-    logging.info("Collecting %d episodes → %s", cfg.n_episodes, output_dir)
+    # Flatten the nested envs dict {suite: {task_id: vec_env}} into a list of vec_envs.
+    flat_envs = [(tg, tid, vec) for tg, group in envs.items() for tid, vec in group.items()]
+    n_tasks = len(flat_envs)
+    eps_per_task = max(1, cfg.n_episodes // n_tasks)
+
+    logging.info("Collecting %d episodes across %d tasks → %s", cfg.n_episodes, n_tasks, output_dir)
+
+    total_pos = 0
+    total_neg = 0
+    ep_offset = 0
+
     with torch.no_grad():
-        pos_count, neg_count = collect_episodes(
-            env=envs,
-            policy=policy,
-            env_preprocessor=env_preprocessor,
-            env_postprocessor=env_postprocessor,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            dataset=dataset,
-            n_episodes=cfg.n_episodes,
-            start_seed=cfg.seed,
-            use_amp=cfg.use_amp,
-            device=device,
-        )
+        for task_group, task_id, env in flat_envs:
+            logging.info("Collecting %d episodes for task_group=%s task_id=%d", eps_per_task, task_group, task_id)
+            pos_count, neg_count = collect_episodes(
+                env=env,
+                policy=policy,
+                env_preprocessor=env_preprocessor,
+                env_postprocessor=env_postprocessor,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                dataset=dataset,
+                n_episodes=eps_per_task,
+                start_seed=cfg.seed + ep_offset,
+                use_amp=cfg.use_amp,
+                device=device,
+            )
+            total_pos += pos_count
+            total_neg += neg_count
+            ep_offset += eps_per_task
 
     dataset.finalize()
 
-    total = pos_count + neg_count
-    pos_rate = pos_count / total if total > 0 else 0.0
+    total = total_pos + total_neg
+    pos_rate = total_pos / total if total > 0 else 0.0
     logging.info(
         "Done. Episodes: %d  Pos (A_pos): %d  Neg (A_neg): %d  Success rate: %.1f%%",
-        total, pos_count, neg_count, pos_rate * 100,
+        total, total_pos, total_neg, pos_rate * 100,
     )
     logging.info("Dataset saved to: %s", output_dir)
-    envs.close()
+    for _, _, env in flat_envs:
+        env.close()
 
 
 if __name__ == "__main__":
