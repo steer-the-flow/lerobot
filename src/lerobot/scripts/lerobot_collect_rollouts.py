@@ -339,16 +339,14 @@ def main(cfg: CollectRolloutsConfig):
     first_env = flat_envs[0][2]
     action_dim = first_env.single_action_space.shape[0]
 
-    # Get image shape from the env's observation space (before LiberoProcessorStep).
-    # LiberoProcessorStep flips images but doesn't resize, so shape is unchanged.
+    # Get actual image shape from the env's observation space.
     obs_space = first_env.single_observation_space
-    obs_height = cfg.env.observation_height
-    obs_width = cfg.env.observation_width
-    # Try to get actual image size from obs_space if available.
-    for key in obs_space.spaces if hasattr(obs_space, "spaces") else {}:
-        if "image" in key or "agentview" in key or "eye_in_hand" in key:
-            obs_height, obs_width = obs_space[key].shape[:2]
-            break
+    obs_height, obs_width = 256, 256  # fallback
+    if hasattr(obs_space, "spaces"):
+        for key, space in obs_space.spaces.items():
+            if hasattr(space, "shape") and len(space.shape) == 3:
+                obs_height, obs_width = space.shape[0], space.shape[1]
+                break
 
     # State dim: eef_pos(3) + axis_angle(3) + gripper_qpos(2) = 8 for LIBERO.
     state_dim = 8
