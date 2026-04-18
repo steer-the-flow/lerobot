@@ -288,9 +288,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        # [RECAP] During inference the batch typically has no advantage_label;
+        # embed_prefix will default to recap_inference_advantage (A_pos).
+        advantage_label = batch.get("advantage_label", None)
+        if advantage_label is not None:
+            advantage_label = advantage_label.long().squeeze(-1)
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise,
+            advantage_label=advantage_label, **kwargs
         )
 
         # Unpad actions
@@ -377,6 +383,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
+        # [RECAP] Extract advantage label if present. Cast to long since it's an index into nn.Embedding.
+        advantage_label = batch.get("advantage_label", None)
+        if advantage_label is not None:
+            advantage_label = advantage_label.long().squeeze(-1)
         loss_dict = {}
 
         # [CHANGED] model.forward() now returns (action_losses, rlt_loss).
@@ -384,7 +394,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         #   "action"         → (action_losses, None)
         #   "reconstruction" → (None, rlt_loss)
         action_losses, rlt_loss = self.model.forward(
-            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time,
+            advantage_label=advantage_label,
         )
 
         # ------------------------------------------------------------------ #
@@ -638,6 +649,14 @@ class VLAFlowMatching(nn.Module):
                 dropout=self.config.rlt_dropout,
             )
 
+        # [RECAP] Binary advantage embedding: maps {0=A_neg, 1=A_pos} to VLM hidden dim.
+        # The token is appended to the prefix so the action expert can cross-attend to it.
+        # Initialized small to avoid disturbing the pretrained prefix distribution at fine-tune start.
+        if self.config.use_advantage_conditioning:
+            vlm_hidden_size = self.vlm_with_expert.config.text_config.hidden_size
+            self.advantage_embedding = nn.Embedding(2, vlm_hidden_size)
+            nn.init.normal_(self.advantage_embedding.weight, std=0.02)
+
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
@@ -668,7 +687,13 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor = None,
+        advantage_label: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -746,6 +771,27 @@ class VLAFlowMatching(nn.Module):
 
         # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1] * (states_seq_len)
+
+        # [RECAP] Append the advantage token to the prefix sequence.
+        # The token is treated as conditioning context (att_mask=1, same as state),
+        # so the action expert can cross-attend to it without early prefix tokens
+        # attending back to it. If no label is provided (inference path), default
+        # to config.recap_inference_advantage (1 = A_pos, steer toward success).
+        if self.config.use_advantage_conditioning:
+            if advantage_label is None:
+                advantage_label = torch.full(
+                    (bsize,),
+                    self.config.recap_inference_advantage,
+                    dtype=torch.long,
+                    device=device,
+                )
+            adv_token = self.advantage_embedding(advantage_label)  # (batch, vlm_hidden)
+            adv_token = adv_token.unsqueeze(1)                     # (batch, 1, vlm_hidden)
+            embs.append(adv_token)
+            adv_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
+            pad_masks.append(adv_mask)
+            att_masks += [1]
+
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -805,7 +851,16 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions=None, noise=None, time=None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions=None,
+        noise=None,
+        time=None,
+        advantage_label: torch.Tensor | None = None,
     ) -> Tensor:
         """Training forward pass. Returns different losses depending on training_mode:
 
@@ -830,6 +885,12 @@ class VLAFlowMatching(nn.Module):
         # "action" mode: standard SmolVLA flow-matching training              #
         # ------------------------------------------------------------------ #
         if self.config.training_mode == "action":
+            if self.config.use_advantage_conditioning and self.training and advantage_label is None:
+                raise ValueError(
+                    "RECAP training requires 'advantage_label' in the batch but it is missing. "
+                    "Use a RECAP-formatted dataset built with collect_rollouts.py."
+                )
+
             # actions must be provided in action mode
             if noise is None:
                 noise = self.sample_noise(actions.shape, actions.device)
@@ -841,7 +902,7 @@ class VLAFlowMatching(nn.Module):
             u_t = noise - actions
 
             prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-                images, img_masks, lang_tokens, lang_masks, state=state
+                images, img_masks, lang_tokens, lang_masks, state=state, advantage_label=advantage_label
             )
             suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
@@ -926,6 +987,7 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        advantage_label: torch.Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -937,7 +999,7 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, advantage_label=advantage_label
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

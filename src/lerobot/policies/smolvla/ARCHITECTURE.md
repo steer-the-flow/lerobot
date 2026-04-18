@@ -228,12 +228,175 @@ value = value_head(z_rl)
 
 ---
 
+---
+
+## RECAP: Advantage-Conditioned Policy Fine-Tuning
+
+RECAP (from π0.6) fine-tunes the action expert by conditioning it on a binary
+**advantage token** derived from rollout outcomes.  It is a *parallel* research
+track to RLT and targets a different problem: improving policy success rate by
+teaching the expert to distinguish successful from failed action distributions,
+rather than learning a compact state representation.
+
+> **RECAP and RLT are mutually exclusive.** Setting both
+> `use_advantage_conditioning=True` and `use_transformer_rlt=True` raises a
+> `ValueError` in `SmolVLAConfig.__post_init__`.
+
+### Core idea
+
+```
+advantage_label ∈ {0, 1}
+  1 = A_pos  →  this episode was successful
+  0 = A_neg  →  this episode failed
+
+Training: pass ground-truth label from rollout outcome.
+Inference: always use label=1 (A_pos) to steer toward success.
+```
+
+The advantage token is a **prefix-side conditioning token**, not a suffix
+token. It is appended to the prefix stream alongside image, language, and
+state tokens so the action expert can cross-attend to it through the existing
+interleaved attention pattern.  No new attention machinery is required.
+
+### Where the token goes
+
+```
+Images ──► SigLIP ──► image tokens
+Language ──► Embed ──► language tokens         PREFIX
+State ──► state_proj ──► state token           (VLM stream)
+advantage_label ──► advantage_embedding ──► advantage token  ← NEW
+
+         ┌──────────────────────────────────────┐
+         │   VLM Text Model (frozen)            │
+         └─────────────────┬────────────────────┘
+                           │ KV cache / cross-attention
+                           ▼
+         ┌──────────────────────────────────────┐
+         │   Action Expert (trained)            │
+         │   cross-attends to full prefix incl. │
+         │   the advantage token                │
+         └─────────────────┬────────────────────┘
+                           ▼
+                    predicted velocity v_t
+```
+
+Concretely, `advantage_embedding = nn.Embedding(2, vlm_hidden_size)` is added
+to `VLAFlowMatching.__init__`.  In `embed_prefix`, after the state token is
+assembled, the advantage token is appended to the `embs` / `pad_masks` /
+`att_masks` lists (att_mask=1, same as state) before `torch.cat`.
+
+### Data labeling
+
+Every frame in an episode gets the **same label** as the episode outcome
+(uniform per-episode credit assignment, as in the π0.6 paper):
+
+```
+label = 1  if episode.success else 0
+```
+
+The `lerobot-collect-rollouts` script handles this: it records episodes and
+writes `advantage_label` per frame after the episode terminates.
+
+### Training data
+
+A mixed dataset combining:
+- Expert demonstrations → labeled A_pos (label=1)
+- Successful rollouts from the BC baseline → labeled A_pos (label=1)
+- Failed rollouts from the BC baseline → labeled A_neg (label=0)
+
+Use `scripts/build_recap_dataset.py` to merge the expert dataset with the
+rollout dataset into a single LeRobotDataset for fine-tuning.
+
+### RECAP training flow
+
+```
+Batch (images, language, state, actions, advantage_label)
+        │
+        ▼
+embed_prefix(advantage_label=label)
+        │    ← image tokens + lang tokens + state token + advantage token
+        ▼
+embed_suffix(noisy_actions, t)
+        │
+        └──────────── VLM + Expert joint forward ────────────┘
+                                │
+                         action_out_proj
+                                │
+                          MSE(v_t, u_t)   ← standard flow-matching loss
+```
+
+The only training change is the extra prefix token.  The loss is identical to
+the BC baseline; the advantage signal enters purely through conditioning.
+
+### Gradient flow
+
+| Component | RECAP training |
+|---|---|
+| Vision encoder | frozen |
+| VLM text model | frozen (`train_expert_only=True`) |
+| Action expert | trained |
+| Action projections | trained |
+| `advantage_embedding` | trained ← new parameter |
+| TransformerRLT | not present (`use_transformer_rlt=False`) |
+
+### Sanity checks (run before full training)
+
+1. `policy.model.advantage_embedding.weight.shape` == `(2, vlm_hidden_size)`.
+2. After one training step: `policy.model.advantage_embedding.weight.grad` is non-None.
+3. Inference with `recap_inference_advantage=1` vs `=0` produces different action chunks on the same initial state.
+4. RECAP loss decreases at a similar rate to the BC baseline.
+
+### Five-phase pipeline
+
+```bash
+# Phase 1: BC baseline (existing)
+lerobot-train \
+  --policy.type=smolvla \
+  --policy.use_advantage_conditioning=false \
+  --policy.use_transformer_rlt=false \
+  --dataset.repo_id=lerobot/libero_spatial_image \
+  --batch_size=32 --steps=20000 \
+  --output_dir=./checkpoints/libero_sft
+
+# Phase 2: collect rollouts with advantage labels
+lerobot-collect-rollouts \
+  --policy.path=./checkpoints/libero_sft/checkpoints/020000/pretrained_model \
+  --env.type=libero --env.task=libero_spatial \
+  --output_repo_id=./data/libero_spatial_recap_rollouts \
+  --n_episodes=500
+
+# Phase 3: build mixed dataset
+python scripts/build_recap_dataset.py \
+  --expert_repo_id=lerobot/libero_spatial_image \
+  --rollouts_repo_id=./data/libero_spatial_recap_rollouts \
+  --output_repo_id=./data/libero_spatial_recap_mixed
+
+# Phase 4: RECAP fine-tuning
+lerobot-train \
+  --policy.path=./checkpoints/libero_sft/checkpoints/020000/pretrained_model \
+  --policy.use_advantage_conditioning=true \
+  --policy.use_transformer_rlt=false \
+  --dataset.repo_id=./data/libero_spatial_recap_mixed \
+  --batch_size=32 --steps=10000 \
+  --output_dir=./checkpoints/libero_recap
+
+# Phase 5: eval (defaults to A_pos at inference)
+MUJOCO_GL=osmesa lerobot-eval \
+  --policy.path=./checkpoints/libero_recap/checkpoints/010000/pretrained_model \
+  --env.type=libero --env.task=libero_spatial \
+  --eval.n_episodes=50
+```
+
+---
+
 ## File Map
 
 | File | Role |
 |---|---|
-| [configuration_smolvla.py](configuration_smolvla.py) | All hyperparameters including RLT config and `training_mode` |
-| [modeling_smolvla.py](modeling_smolvla.py) | `SmolVLAPolicy` (outer wrapper) and `VLAFlowMatching` (core model); training branching logic |
+| [configuration_smolvla.py](configuration_smolvla.py) | All hyperparameters including RLT config, `training_mode`, and RECAP flags |
+| [modeling_smolvla.py](modeling_smolvla.py) | `SmolVLAPolicy` (outer wrapper) and `VLAFlowMatching` (core model); training branching logic; advantage embedding |
 | [smolvlm_with_expert.py](smolvlm_with_expert.py) | `SmolVLMWithExpertModel`: interleaved VLM + action expert transformer |
-| [transformer_rlt.py](transformer_rlt.py) | `TransformerRLT`: encoder-decoder bottleneck for learning `z_rl` |
+| [transformer_rlt.py](transformer_rlt.py) | `TransformerRLT`: encoder-decoder bottleneck for learning `z_rl` (RLT track only) |
 | [processor_smolvla.py](processor_smolvla.py) | Image and text preprocessing |
+| [../../scripts/lerobot_collect_rollouts.py](../../scripts/lerobot_collect_rollouts.py) | Rollout collection with advantage labels (RECAP track) |
+| [../../../../scripts/build_recap_dataset.py](../../../../scripts/build_recap_dataset.py) | Merge expert demos + rollouts into mixed RECAP dataset |
