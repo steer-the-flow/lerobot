@@ -83,15 +83,16 @@ def obs_to_smolvla_batch(
 
 
 @torch.no_grad()
-def extract_rl_state(
+def extract_rl_state_and_vla_ref(
     vla: SmolVLAPolicy,
     batch: dict,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return (z_rl, proprio_padded) from a SmolVLA batch.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """VLM forward returning (z_rl, proprio, vla_ref_chunk).
 
-    z_rl          : (1, rlt_d_model)  — from frozen RLT encoder (default 2048)
-    proprio_padded: (1, max_state_dim) — state padded (default 32)
+    z_rl      : (1, rlt_d_model)
+    proprio   : (1, max_state_dim)
+    vla_ref   : (1, chunk_size, action_dim)
     """
     images, img_masks = vla.prepare_images(batch)
     state = vla.prepare_state(batch)
@@ -102,21 +103,10 @@ def extract_rl_state(
     img_masks = [m.to(device) for m in img_masks]
     state = state.to(device)
 
-    z_rl = vla.model.get_rl_state(images, img_masks, lang_tokens, lang_masks, state)
-    return z_rl, state
-
-
-@torch.no_grad()
-def get_vla_ref_action(
-    vla: SmolVLAPolicy,
-    batch: dict,
-) -> torch.Tensor:
-    """Run VLA denoising to get the reference action chunk.
-
-    Returns: (1, C, action_dim) float32 — already sliced to original_action_dim (4).
-    """
-    vla.reset()
-    return vla.predict_action_chunk(batch)  # (1, C, 4)
+    z_rl, actions = vla.model.get_rl_state_and_actions(images, img_masks, lang_tokens, lang_masks, state)
+    original_action_dim = vla.config.action_feature.shape[0]
+    vla_ref = actions[:, :, :original_action_dim]
+    return z_rl, state, vla_ref
 
 
 def collect_episode(
@@ -148,12 +138,8 @@ def collect_episode(
     while True:
         batch = obs_to_smolvla_batch(obs, lang_tokens, lang_masks, image_key, device)
 
-        # --- Extract RL state at current obs ---
-        z_rl, proprio = extract_rl_state(vla, batch, device)
+        z_rl, proprio, vla_ref = extract_rl_state_and_vla_ref(vla, batch, device)
         rl_state = torch.cat([z_rl, proprio], dim=-1)
-
-        # --- Get VLA reference action ---
-        vla_ref = get_vla_ref_action(vla, batch)                # (1, C, 4)
         vla_ref_flat = vla_ref.flatten(1)                       # (1, 40)
 
         # --- Pick executed action ---
@@ -181,7 +167,7 @@ def collect_episode(
                 break
 
         next_batch = obs_to_smolvla_batch(next_obs, lang_tokens, lang_masks, image_key, device)
-        next_z_rl, next_proprio = extract_rl_state(vla, next_batch, device)
+        next_z_rl, next_proprio, _ = extract_rl_state_and_vla_ref(vla, next_batch, device)
         next_rl_state = torch.cat([next_z_rl, next_proprio], dim=-1)
 
         replay.add(
@@ -229,8 +215,7 @@ def evaluate(
 
         while not done:
             batch = obs_to_smolvla_batch(obs, lang_tokens, lang_masks, image_key, device)
-            z_rl, proprio = extract_rl_state(vla, batch, device)
-            vla_ref = get_vla_ref_action(vla, batch)
+            z_rl, proprio, vla_ref = extract_rl_state_and_vla_ref(vla, batch, device)
             vla_ref_flat = vla_ref.flatten(1)
 
             action_chunk = actor.select_action(z_rl, proprio, vla_ref_flat, add_noise=False)

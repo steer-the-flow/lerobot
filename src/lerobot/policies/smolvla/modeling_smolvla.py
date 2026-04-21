@@ -942,6 +942,55 @@ class VLAFlowMatching(nn.Module):
         )
         return self.transformer_rlt.encode(prefix_out.float())  # (batch, rlt_d_model)
 
+    def get_rl_state_and_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None) -> tuple[Tensor, Tensor]:
+        """
+        Returns:
+            z_rl   : (batch, rlt_d_model)
+            actions: (batch, chunk_size, max_action_dim)
+        """
+        assert hasattr(self, "transformer_rlt"), (
+            "get_rl_state_and_actions requires use_transformer_rlt=True in SmolVLAConfig"
+        )
+        bsize = state.shape[0]
+        device = state.device
+
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        (prefix_out, _), past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+
+        z_rl = self.transformer_rlt.encode(prefix_out.float())
+
+        num_steps = self.config.num_steps
+        dt = -1.0 / num_steps
+        x_t = noise
+        for step in range(num_steps):
+            time = 1.0 + step * dt
+            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            v_t = self.denoise_step(
+                x_t=x_t,
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                timestep=time_tensor,
+            )
+            x_t = x_t + dt * v_t
+
+        return z_rl, x_t
+
     def sample_actions(
         self,
         images,
