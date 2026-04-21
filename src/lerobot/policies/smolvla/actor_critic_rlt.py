@@ -33,6 +33,8 @@ class RLTActorCriticConfig:
     beta: float = 0.1        # VLA reg. weight
     ref_action_dropout_prob: float = 0.5   # Paper
     actor_output_variance: float = 0.1     # Exploration noise variance
+    target_noise_std: float = 0.2          # TD3 target policy smoothing std
+    target_noise_clip: float = 0.5         # TD3 target policy smoothing clip range
 
     # Dimensions — must match SmolVLAConfig
     z_rl_dim: int = 2048     # rlt_d_model
@@ -209,7 +211,12 @@ def compute_td3_critic_loss(
             next_z_rl.shape[0], config.action_flat_dim, device=rl_state.device
         )
         next_action = target_actor(next_z_rl, next_proprio, next_vla_ref)
-        next_action_flat = next_action.flatten(1).clamp(-1.0, 1.0)
+        next_action_flat = next_action.flatten(1)
+
+        # TD3 target policy smoothing
+        noise = torch.randn_like(next_action_flat) * config.target_noise_std
+        noise = noise.clamp(-config.target_noise_clip, config.target_noise_clip)
+        next_action_flat = (next_action_flat + noise).clamp(-1.0, 1.0)
 
         q1_tgt, q2_tgt = target_critic(next_rl_state, next_action_flat)
         q_next = torch.min(q1_tgt, q2_tgt)
