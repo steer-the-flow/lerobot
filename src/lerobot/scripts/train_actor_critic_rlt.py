@@ -6,8 +6,7 @@ Usage (see scripts/train_rlt_ac.sh for SLURM wrapper):
     python train_actor_critic_rlt.py \
         --vla_checkpoint /path/to/peg-sft \
         --output_dir /path/to/output \
-        --task peg-insert-side-v3 \
-        --image_key observation.images.corner2
+        --task peg-insert-side-v3
 """
 
 import time
@@ -18,6 +17,7 @@ import logging
 from pathlib import Path
 
 from lerobot.envs.metaworld import MetaworldEnv
+from lerobot.envs.utils import preprocess_observation
 from lerobot.policies.smolvla.actor_critic_rlt import (
     RLTActor,
     RLTActorCriticConfig,
@@ -27,59 +27,13 @@ from lerobot.policies.smolvla.actor_critic_rlt import (
     make_target,
     polyak_update,
 )
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.rl.buffer import ReplayBuffer
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
 log = logging.getLogger(__name__)
-
-
-def tokenize_task(vla: SmolVLAPolicy, task_description: str, device: torch.device):
-    """Tokenize task description using VLM tokenizer. Called once at startup."""
-    tokenizer = vla.model.vlm_with_expert.processor.tokenizer
-    text = task_description + "\n"  # SmolVLA appends newline (SmolVLANewLineProcessor)
-    cfg = vla.config
-    encoded = tokenizer(
-        text,
-        return_tensors="pt",
-        padding="max_length" if cfg.pad_language_to is not None else True,
-        max_length=cfg.tokenizer_max_length,
-        truncation=True,
-    )
-    return encoded["input_ids"].to(device), encoded["attention_mask"].bool().to(device)
-
-
-def obs_to_smolvla_batch(
-    obs: dict,
-    lang_tokens: torch.Tensor,
-    lang_masks: torch.Tensor,
-    image_key: str,
-    device: torch.device,
-) -> dict:
-    """Convert a single Metaworld observation dict to a SmolVLA batch dict.
-
-    MetaworldEnv (obs_type='pixels_agent_pos') returns:
-        obs["pixels"]    — np.ndarray (H, W, 3) uint8
-        obs["agent_pos"] — np.ndarray (4,)  [x, y, z, gripper]
-
-    SmolVLA expects:
-        batch[image_key]              — (1, 3, H, W) float32 in [0, 1]
-        batch["observation.state"]    — (1, 4) float32
-        batch[OBS_LANGUAGE_TOKENS]    — (1, seq_len) int64
-        batch[OBS_LANGUAGE_ATTENTION_MASK] — (1, seq_len) int64
-    """
-    img = torch.from_numpy(obs["pixels"].copy()).float() / 255.0  # (H, W, 3)
-    img = img.permute(2, 0, 1).unsqueeze(0).to(device)            # (1, 3, H, W)
-
-    state = torch.from_numpy(obs["agent_pos"].copy()).float().unsqueeze(0).to(device)  # (1, 4)
-
-    return {
-        image_key: img,
-        OBS_STATE: state,
-        OBS_LANGUAGE_TOKENS: lang_tokens,
-        OBS_LANGUAGE_ATTENTION_MASK: lang_masks,
-    }
 
 
 @torch.no_grad()
@@ -114,21 +68,19 @@ def collect_episode(
     vla: SmolVLAPolicy,
     actor: RLTActor | None,
     replay: ReplayBuffer,
-    lang_tokens: torch.Tensor,
-    lang_masks: torch.Tensor,
-    image_key: str,
+    preprocessor,
+    postprocessor,
     config: RLTActorCriticConfig,
     device: torch.device,
     use_actor: bool = True,
 ) -> dict:
     """Run one full episode and push chunk-level transitions into the replay buffer.
 
+    Uses the lerobot preprocessor pipeline for state normalization and tokenization.
     During warmup (use_actor=False) the VLA reference action is executed directly.
     During RL training (use_actor=True) the actor produces the executed chunk.
-
-    Returns episode info dict: {"success": bool, "steps": int, "transitions": int}
     """
-    obs, _ = env.reset()
+    raw_obs, _ = env.reset()
     vla.reset()
 
     episode_success = False
@@ -137,9 +89,13 @@ def collect_episode(
     transitions_added = 0
 
     while True:
-        batch = obs_to_smolvla_batch(obs, lang_tokens, lang_masks, image_key, device)
+        # --- Preprocess: normalize state, tokenize task ---
+        obs = preprocess_observation(raw_obs)
+        obs["task"] = env.task_description
+        obs = preprocessor(obs)
 
-        z_rl, proprio, vla_ref = extract_rl_state_and_vla_ref(vla, batch, device)
+        # --- VLM forward ---
+        z_rl, proprio, vla_ref = extract_rl_state_and_vla_ref(vla, obs, device)
         rl_state = torch.cat([z_rl, proprio], dim=-1)
         vla_ref_flat = vla_ref.flatten(1)                       # (1, 40)
 
@@ -149,16 +105,19 @@ def collect_episode(
         if use_actor and actor is not None:
             action_chunk = actor.select_action(z_rl, proprio, vla_ref_flat, add_noise=True)
         else:
-            action_chunk = vla_ref  # warmup: execute VLA directly
+            action_chunk = vla_ref  # (1, C, action_dim)
+
+        # Unnormalize for env execution; store normalized copy in replay buffer
+        action_chunk_exec = postprocessor(action_chunk)
 
         # --- Execute C steps in environment ---
         chunk_reward = 0.0
         done = False
         truncated = False
 
-        for step_in_chunk in range(config.chunk_size_rl):
-            action_np = action_chunk[0, step_in_chunk].detach().cpu().numpy()
-            next_obs, reward, terminated, truncated, info = env.step(action_np)
+        for step_i in range(config.chunk_size_rl):
+            action_np = action_chunk_exec[0, step_i].detach().cpu().numpy()
+            raw_next_obs, reward, terminated, truncated, info = env.step(action_np)
             chunk_reward += reward
             total_reward += reward
             total_steps += 1
@@ -168,8 +127,12 @@ def collect_episode(
                 episode_success = bool(info.get("is_success", False))
                 break
 
-        next_batch = obs_to_smolvla_batch(next_obs, lang_tokens, lang_masks, image_key, device)
-        next_z_rl, next_proprio, _ = extract_rl_state_and_vla_ref(vla, next_batch, device)
+        # --- Compute next rl_state ---
+        next_obs = preprocess_observation(raw_next_obs)
+        next_obs["task"] = env.task_description
+        next_obs = preprocessor(next_obs)
+
+        next_z_rl, next_proprio, next_vla_ref = extract_rl_state_and_vla_ref(vla, next_obs, device)
         next_rl_state = torch.cat([next_z_rl, next_proprio], dim=-1)
 
         replay.add(
@@ -185,7 +148,7 @@ def collect_episode(
 
         if done:
             break
-        obs = next_obs
+        raw_obs = raw_next_obs
 
     return {
         "success": episode_success,
@@ -200,32 +163,35 @@ def evaluate(
     env: MetaworldEnv,
     vla: SmolVLAPolicy,
     actor: RLTActor,
-    lang_tokens: torch.Tensor,
-    lang_masks: torch.Tensor,
-    image_key: str,
+    preprocessor,
+    postprocessor,
     config: RLTActorCriticConfig,
     device: torch.device,
     n_episodes: int = 10,
 ) -> float:
-    """Run n_episodes with the actor (no noise, no dropout) and return success rate."""
+    """Run n_episodes with the actor (no noise) and return success rate."""
     actor.eval()
     successes = 0
 
     for _ in range(n_episodes):
-        obs, _ = env.reset()
+        raw_obs, _ = env.reset()
         vla.reset()
         done = False
 
         while not done:
-            batch = obs_to_smolvla_batch(obs, lang_tokens, lang_masks, image_key, device)
-            z_rl, proprio, vla_ref = extract_rl_state_and_vla_ref(vla, batch, device)
+            obs = preprocess_observation(raw_obs)
+            obs["task"] = env.task_description
+            obs = preprocessor(obs)
+
+            z_rl, proprio, vla_ref = extract_rl_state_and_vla_ref(vla, obs, device)
             vla_ref_flat = vla_ref.flatten(1)
 
             action_chunk = actor.select_action(z_rl, proprio, vla_ref_flat, add_noise=False)
+            action_chunk_exec = postprocessor(action_chunk)
 
-            for step_in_chunk in range(config.chunk_size_rl):
-                action_np = action_chunk[0, step_in_chunk].cpu().numpy()
-                obs, _, terminated, truncated, info = env.step(action_np)
+            for step_i in range(config.chunk_size_rl):
+                action_np = action_chunk_exec[0, step_i].cpu().numpy()
+                raw_obs, _, terminated, truncated, info = env.step(action_np)
                 done = terminated or truncated
                 if done:
                     successes += int(info.get("is_success", False))
@@ -279,14 +245,14 @@ def train(args):
     for p in vla.parameters():
         p.requires_grad_(False)
 
-    # --- Tokenize task description once ---
-    from lerobot.envs.metaworld import TASK_DESCRIPTIONS
-    task_desc = TASK_DESCRIPTIONS.get(args.task, args.task)
-    log.info(f"Task: {args.task} | Description: '{task_desc}'")
-    lang_tokens, lang_masks = tokenize_task(vla, task_desc, device)
+    # --- Load preprocessor / postprocessor from VLA checkpoint ---
+    preprocessor, postprocessor = make_pre_post_processors(
+        vla.config, pretrained_path=args.vla_checkpoint
+    )
 
     # --- Environment ---
     env = MetaworldEnv(task=args.task, obs_type="pixels_agent_pos", render_mode="rgb_array")
+    log.info(f"Env task: {args.task} | description: '{env.task_description}'")
 
     # --- Actor & Critics ---
     actor = RLTActor(config).to(device)
@@ -317,9 +283,8 @@ def train(args):
     for ep in range(config.warmup_episodes):
         info = collect_episode(
             env, vla, actor=None, replay=replay,
-            lang_tokens=lang_tokens, lang_masks=lang_masks,
-            image_key=args.image_key, config=config,
-            device=device, use_actor=False,
+            preprocessor=preprocessor, postprocessor=postprocessor,
+            config=config, device=device, use_actor=False,
         )
         warmup_successes += int(info["success"])
         log.info(f"  Warmup ep {ep+1}/{config.warmup_episodes} | success={info['success']} | "
@@ -340,9 +305,8 @@ def train(args):
         # Collect one episode with actor
         ep_info = collect_episode(
             env, vla, actor=actor, replay=replay,
-            lang_tokens=lang_tokens, lang_masks=lang_masks,
-            image_key=args.image_key, config=config,
-            device=device, use_actor=True,
+            preprocessor=preprocessor, postprocessor=postprocessor,
+            config=config, device=device, use_actor=True,
         )
 
         # G gradient updates per chunk-transition collected this episode
@@ -428,8 +392,9 @@ def train(args):
         # --- Evaluation ---
         if (episode + 1) % config.eval_freq == 0:
             success_rate = evaluate(
-                env, vla, actor, lang_tokens, lang_masks,
-                args.image_key, config, device, n_episodes=config.eval_episodes,
+                env, vla, actor,
+                preprocessor, postprocessor,
+                config, device, n_episodes=config.eval_episodes,
             )
             log.info(f"  [EVAL] Episode {episode+1} | success_rate={success_rate:.2f}")
 
@@ -472,7 +437,6 @@ def parse_args():
 
     # Environment
     p.add_argument("--task", type=str, default="peg-insert-side-v3")
-    p.add_argument("--image_key", type=str, default="observation.images.corner2", help="Image key in SmolVLA batch dict — check vla.config.image_features")
 
     # Training budget
     p.add_argument("--total_episodes", type=int, default=1000)
