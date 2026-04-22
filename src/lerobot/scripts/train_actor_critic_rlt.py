@@ -14,6 +14,7 @@ import torch
 import wandb
 import argparse
 import logging
+import math
 from pathlib import Path
 
 from lerobot.envs.metaworld import MetaworldEnv
@@ -30,6 +31,7 @@ from lerobot.policies.smolvla.actor_critic_rlt import (
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.rl.buffer import ReplayBuffer
+from lerobot.utils.io_utils import write_video
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
@@ -61,6 +63,35 @@ def extract_rl_state_and_vla_ref(
     original_action_dim = vla.config.action_feature.shape[0]
     vla_ref = actions[:, :, :original_action_dim]
     return z_rl, state, vla_ref
+
+
+def get_q_loss_weight(
+    episode: int,
+    curriculum_start_episode: int | None,
+    config: RLTActorCriticConfig,
+) -> float:
+    if curriculum_start_episode is None:
+        return 0.0
+
+    if config.q_loss_weight_increment <= 0 or config.q_loss_weight_max <= 0:
+        return 0.0
+
+    jumps_needed = max(1, math.ceil(config.q_loss_weight_max / config.q_loss_weight_increment))
+    remaining_episodes = max(1, config.total_episodes - curriculum_start_episode)
+    progressed_episodes = min(remaining_episodes, episode - curriculum_start_episode + 1)
+    completed_jumps = max(1, math.ceil(progressed_episodes * jumps_needed / remaining_episodes))
+    return min(config.q_loss_weight_max, completed_jumps * config.q_loss_weight_increment)
+
+
+def get_ref_action_dropout_prob(
+    q_loss_weight: float,
+    config: RLTActorCriticConfig,
+) -> float:
+    if config.ref_action_dropout_prob <= 0 or config.q_loss_weight_max <= 0:
+        return 0.0
+
+    progress = min(1.0, max(0.0, q_loss_weight / config.q_loss_weight_max))
+    return progress * config.ref_action_dropout_prob
 
 
 def collect_episode(
@@ -169,15 +200,23 @@ def evaluate(
     config: RLTActorCriticConfig,
     device: torch.device,
     n_episodes: int = 10,
-) -> float:
-    """Run n_episodes with the actor (no noise) and return success rate."""
+    max_videos: int = 0,
+    videos_dir: Path | None = None,
+    video_prefix: str = "eval",
+) -> tuple[float, list[Path]]:
+    """Run n_episodes with the actor (no noise), optionally save videos, and return success rate."""
     actor.eval()
     successes = 0
+    saved_videos: list[Path] = []
 
-    for _ in range(n_episodes):
+    for episode_idx in range(n_episodes):
         raw_obs, _ = env.reset()
         vla.reset()
         done = False
+        frames = []
+
+        if episode_idx < max_videos:
+            frames.append(env.render())
 
         while not done:
             obs = preprocess_observation(raw_obs)
@@ -193,13 +232,21 @@ def evaluate(
             for step_i in range(config.chunk_size_rl):
                 action_np = action_chunk_exec[0, step_i].cpu().numpy()
                 raw_obs, _, terminated, truncated, info = env.step(action_np)
+                if episode_idx < max_videos:
+                    frames.append(env.render())
                 done = terminated or truncated
                 if done:
                     successes += int(info.get("is_success", False))
                     break
 
+        if episode_idx < max_videos and videos_dir is not None and len(frames) > 0:
+            videos_dir.mkdir(parents=True, exist_ok=True)
+            video_path = videos_dir / f"{video_prefix}_episode_{episode_idx}.mp4"
+            write_video(str(video_path), frames, fps=env.metadata["render_fps"])
+            saved_videos.append(video_path)
+
     actor.train()
-    return successes / n_episodes
+    return successes / n_episodes, saved_videos
 
 
 def train(args):
@@ -215,11 +262,15 @@ def train(args):
         batch_size_rl=args.batch_size,
         G=args.G,
         beta=args.beta,
+        ref_action_dropout_prob=args.ref_action_dropout_prob,
+        actor_output_variance=args.actor_output_variance,
         gamma=args.gamma,
         tau=args.tau,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
         replay_buffer_capacity=args.buffer_capacity,
+        q_loss_weight_max=args.q_loss_weight_max,
+        q_loss_weight_increment=args.q_loss_weight_increment,
     )
 
     # --- WandB ---
@@ -299,6 +350,7 @@ def train(args):
     # -------------------------------------------------------------------
     global_grad_step = 0
     best_success_rate = 0.0
+    q_curriculum_start_episode = None
 
     for episode in range(config.total_episodes):
         t0 = time.time()
@@ -308,10 +360,14 @@ def train(args):
             preprocessor=preprocessor, postprocessor=postprocessor,
             config=config, device=device, use_actor=True,
         )
+        if ep_info["success"] and q_curriculum_start_episode is None:
+            q_curriculum_start_episode = episode
+        q_loss_weight = get_q_loss_weight(episode, q_curriculum_start_episode, config)
+        ref_action_dropout_prob = get_ref_action_dropout_prob(q_loss_weight, config)
 
         # G gradient updates per chunk-transition collected this episode
         n_updates = config.G * ep_info["transitions"]
-        critic_losses, actor_losses, q1_vals, beta_losses = [], [], [], []
+        critic_losses, actor_losses, beta_losses = [], [], []
         actor_q_terms, delta_abs_means, delta_abs_maxes, ref_keep_fracs = [], [], [], []
         critic_grad_norms, actor_grad_norms = [], []
 
@@ -343,14 +399,19 @@ def train(args):
                 vla_ref = batch["complementary_info"]["vla_ref_action"].to(device)
 
                 actor_stats = compute_td3_actor_loss(
-                    rl_state, vla_ref, actor, critic, config
+                    rl_state,
+                    vla_ref,
+                    actor,
+                    critic,
+                    config,
+                    q_loss_weight=q_loss_weight,
+                    ref_action_dropout_prob=ref_action_dropout_prob,
                 )
                 actor_optimizer.zero_grad()
                 actor_stats["loss"].backward()
                 a_grad_norm = torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
                 actor_optimizer.step()
                 actor_losses.append(actor_stats["loss"].item())
-                q1_vals.append(actor_stats["q1_mean"])
                 beta_losses.append(actor_stats["beta_loss"])
                 actor_q_terms.append(actor_stats["actor_q_term"])
                 delta_abs_means.append(actor_stats["delta_abs_mean"])
@@ -366,7 +427,6 @@ def train(args):
         ep_time = time.time() - t0
         mean_c_loss = sum(critic_losses) / len(critic_losses) if critic_losses else 0.0
         mean_a_loss = sum(actor_losses) / len(actor_losses) if actor_losses else 0.0
-        mean_q1 = sum(q1_vals) / len(q1_vals) if q1_vals else 0.0
         mean_actor_q_term = sum(actor_q_terms) / len(actor_q_terms) if actor_q_terms else 0.0
         mean_beta = sum(beta_losses) / len(beta_losses) if beta_losses else 0.0
         mean_delta_abs = sum(delta_abs_means) / len(delta_abs_means) if delta_abs_means else 0.0
@@ -379,7 +439,8 @@ def train(args):
             f"Ep {episode+1}/{config.total_episodes} | "
             f"success={ep_info['success']} | steps={ep_info['steps']} | reward={ep_info['reward']:.3f} | "
             f"c_loss={mean_c_loss:.4f} | a_loss={mean_a_loss:.4f} | "
-            f"q1={mean_q1:.4f} | actor_q={mean_actor_q_term:.4f} | beta_loss={mean_beta:.4f} | "
+            f"q_w={q_loss_weight:.2f} | ref_drop={ref_action_dropout_prob:.2f} | "
+            f"actor_q={mean_actor_q_term:.4f} | actor_reg={mean_beta:.4f} | "
             f"delta_abs={mean_delta_abs:.4f}/{max_delta_abs:.4f} | keep={mean_ref_keep:.3f} | "
             f"buf={replay.size} | t={ep_time:.1f}s"
         )
@@ -392,9 +453,10 @@ def train(args):
                 "episode_length": ep_info["steps"],
                 "critic_loss": mean_c_loss,
                 "actor_loss": mean_a_loss,
-                "q1_mean": mean_q1,
+                "actor_q_weight": q_loss_weight,
+                "actor_ref_dropout_prob": ref_action_dropout_prob,
                 "actor_q_term": mean_actor_q_term,
-                "vla_reg_loss": mean_beta,
+                "actor_reg_term": mean_beta,
                 "delta_abs_mean": mean_delta_abs,
                 "delta_abs_max": max_delta_abs,
                 "ref_keep_frac": mean_ref_keep,
@@ -406,15 +468,27 @@ def train(args):
 
         # --- Evaluation ---
         if (episode + 1) % config.eval_freq == 0:
-            success_rate = evaluate(
+            videos_dir = output_dir / "eval_videos" / f"episode_{episode+1}"
+            success_rate, saved_videos = evaluate(
                 env, vla, actor,
                 preprocessor, postprocessor,
                 config, device, n_episodes=config.eval_episodes,
+                max_videos=args.eval_videos_to_save,
+                videos_dir=videos_dir,
+                video_prefix=f"eval_ep{episode+1}",
             )
             log.info(f"  [EVAL] Episode {episode+1} | success_rate={success_rate:.2f}")
 
             if args.wandb:
-                wandb.log({"eval/success_rate": success_rate, "episode": episode})
+                log_payload = {"eval/success_rate": success_rate, "episode": episode}
+                if saved_videos:
+                    for i, video_path in enumerate(saved_videos):
+                        log_payload[f"eval/video_{i}"] = wandb.Video(str(video_path), format="mp4")
+                    artifact = wandb.Artifact(f"eval-videos-{args.job_name}-ep{episode+1}", type="evaluation")
+                    for video_path in saved_videos:
+                        artifact.add_file(str(video_path))
+                    wandb.log_artifact(artifact)
+                wandb.log(log_payload)
 
             # Save checkpoint
             ckpt = {
@@ -458,12 +532,17 @@ def parse_args():
     p.add_argument("--warmup_episodes", type=int, default=20)
     p.add_argument("--eval_freq", type=int, default=50)
     p.add_argument("--eval_episodes", type=int, default=10)
+    p.add_argument("--eval_videos_to_save", type=int, default=1, help="Number of evaluation episodes to save as videos each eval")
 
     # Hyperparameters
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--buffer_capacity", type=int, default=10_000)
     p.add_argument("--G", type=int, default=5, help="Gradient steps per chunk transition (paper)")
     p.add_argument("--beta", type=float, default=0.1, help="VLA regularization weight")
+    p.add_argument("--ref_action_dropout_prob", type=float, default=0.5, help="Probability of dropping the VLA reference action during actor training")
+    p.add_argument("--actor_output_variance", type=float, default=0.1, help="Exploration noise variance added to actor outputs during rollout")
+    p.add_argument("--q_loss_weight_max", type=float, default=1.0, help="Maximum weight on the critic term in actor loss")
+    p.add_argument("--q_loss_weight_increment", type=float, default=0.1, help="Size of each staircase jump in critic-term weight after first success")
     p.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate")
     p.add_argument("--actor_lr", type=float, default=3e-4)

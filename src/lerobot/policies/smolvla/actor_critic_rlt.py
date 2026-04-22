@@ -31,6 +31,8 @@ class RLTActorCriticConfig:
     tau: float = 0.005       # Polyak rate
     gamma: float = 0.99      # Discount factor
     beta: float = 0.1        # VLA reg. weight
+    q_loss_weight_max: float = 1.0
+    q_loss_weight_increment: float = 0.1
     ref_action_dropout_prob: float = 0.5   # Paper
     actor_output_variance: float = 0.1     # Exploration noise variance
     target_noise_std: float = 0.2          # TD3 target policy smoothing std
@@ -231,20 +233,23 @@ def compute_td3_actor_loss(
     actor: RLTActor,
     critic: RLTCritic,
     config: RLTActorCriticConfig,
+    q_loss_weight: float = 1.0,
+    ref_action_dropout_prob: float | None = None,
 ) -> torch.Tensor:
     """TD3 actor loss with VLA regularization.
 
-    L = -Q1(s, a) + β · ||a − ã||²
+    L = λ_q · (-Q1(s, a)) + β · ||a − ã||²
 
     Reference action dropout is applied here (not at rollout time) so that
     gradients see both the conditioned and unconditioned actor paths.
     """
     z_rl = rl_state[:, : config.z_rl_dim]
     proprio = rl_state[:, config.z_rl_dim :]
+    dropout_prob = config.ref_action_dropout_prob if ref_action_dropout_prob is None else ref_action_dropout_prob
 
     keep_mask = (
         torch.rand(vla_ref_flat.shape[0], 1, device=vla_ref_flat.device)
-        >= config.ref_action_dropout_prob
+        >= dropout_prob
     ).to(vla_ref_flat.dtype)
     vla_ref_input = vla_ref_flat * keep_mask
 
@@ -255,12 +260,14 @@ def compute_td3_actor_loss(
     q1 = critic.q1(rl_state, action_flat)
     beta_loss = F.mse_loss(action_flat, vla_ref_flat)
     actor_q_term = -q1.mean()
-    total = actor_q_term + config.beta * beta_loss
+    total = q_loss_weight * actor_q_term + config.beta * beta_loss
     return {
         "loss": total,
         "q1_mean": q1.mean().item(),
         "actor_q_term": actor_q_term.item(),
         "beta_loss": beta_loss.item(),
+        "q_loss_weight": q_loss_weight,
+        "ref_action_dropout_prob": dropout_prob,
         "delta_abs_mean": delta.abs().mean().item(),
         "delta_abs_max": delta.abs().max().item(),
         "ref_keep_frac": keep_mask.mean().item(),
