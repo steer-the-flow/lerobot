@@ -149,7 +149,7 @@ def collect_episode(
         for step_i in range(config.chunk_size_rl):
             action_np = action_chunk_exec[0, step_i].detach().cpu().numpy()
             raw_next_obs, reward, terminated, truncated, info = env.step(action_np)
-            chunk_reward += reward
+            chunk_reward += (config.gamma ** step_i) * reward
             total_reward += reward
             total_steps += 1
             done = terminated or truncated

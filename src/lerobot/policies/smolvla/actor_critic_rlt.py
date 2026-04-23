@@ -215,7 +215,7 @@ def compute_td3_critic_loss(
         # TD3 target policy smoothing
         noise = torch.randn_like(next_action_flat) * config.target_noise_std
         noise = noise.clamp(-config.target_noise_clip, config.target_noise_clip)
-        next_action_flat = next_action_flat + noise
+        next_action_flat = (next_action_flat + noise).clamp(-1.0, 1.0)
 
         q1_tgt, q2_tgt = target_critic(next_rl_state, next_action_flat)
         q_next = torch.min(q1_tgt, q2_tgt)
@@ -258,7 +258,7 @@ def compute_td3_actor_loss(
     delta = action_flat - vla_ref_flat
 
     q1 = critic.q1(rl_state, action_flat)
-    beta_loss = F.mse_loss(action_flat, vla_ref_flat)
+    beta_loss = (action_flat - vla_ref_flat).pow(2).sum(dim=-1).mean()
     actor_q_term = -q1.mean()
     total = q_loss_weight * actor_q_term + config.beta * beta_loss
     return {
