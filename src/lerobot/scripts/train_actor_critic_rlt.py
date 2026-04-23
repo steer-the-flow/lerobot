@@ -113,6 +113,7 @@ def collect_episode(
     """
     raw_obs, _ = env.reset()
     vla.reset()
+    cached_current = None
 
     episode_success = False
     total_steps = 0
@@ -120,13 +121,15 @@ def collect_episode(
     transitions_added = 0
 
     while True:
-        # --- Preprocess: normalize state, tokenize task ---
-        obs = preprocess_observation(raw_obs)
-        obs["task"] = env.task_description
-        obs = preprocessor(obs)
-
-        # --- VLM forward ---
-        z_rl, proprio, vla_ref = extract_rl_state_and_vla_ref(vla, obs, device)
+        # Reuse the already-computed next-state VLA features from the previous chunk when available. 
+        if cached_current is None:
+            obs = preprocess_observation(raw_obs)
+            obs["task"] = env.task_description
+            obs = preprocessor(obs)
+            z_rl, proprio, vla_ref = extract_rl_state_and_vla_ref(vla, obs, device)
+        else:
+            z_rl, proprio, vla_ref = cached_current
+            cached_current = None
         rl_state = torch.cat([z_rl, proprio], dim=-1)
         vla_ref_flat = vla_ref.flatten(1)                       # (1, 40)
 
@@ -156,13 +159,18 @@ def collect_episode(
                 break
 
         # --- Compute next rl_state ---
-        next_obs = preprocess_observation(raw_next_obs)
-        next_obs["task"] = env.task_description
-        next_obs = preprocessor(next_obs)
+        if done:
+            next_rl_state = torch.zeros_like(rl_state)
+            next_vla_ref_flat = torch.zeros_like(vla_ref_flat)
+        else:
+            next_obs = preprocess_observation(raw_next_obs)
+            next_obs["task"] = env.task_description
+            next_obs = preprocessor(next_obs)
 
-        next_z_rl, next_proprio, next_vla_ref = extract_rl_state_and_vla_ref(vla, next_obs, device)
-        next_rl_state = torch.cat([next_z_rl, next_proprio], dim=-1)
-        next_vla_ref_flat = next_vla_ref.flatten(1)
+            next_z_rl, next_proprio, next_vla_ref = extract_rl_state_and_vla_ref(vla, next_obs, device)
+            next_rl_state = torch.cat([next_z_rl, next_proprio], dim=-1)
+            next_vla_ref_flat = next_vla_ref.flatten(1)
+            cached_current = (next_z_rl, next_proprio, next_vla_ref)
 
         replay.add(
             state={"rl_state": rl_state.squeeze(0).cpu()},
@@ -351,6 +359,7 @@ def train(args):
     global_grad_step = 0
     best_success_rate = 0.0
     q_curriculum_start_episode = None
+    q_curriculum_triggered = False
 
     for episode in range(config.total_episodes):
         t0 = time.time()
@@ -360,8 +369,6 @@ def train(args):
             preprocessor=preprocessor, postprocessor=postprocessor,
             config=config, device=device, use_actor=True,
         )
-        if ep_info["success"] and q_curriculum_start_episode is None:
-            q_curriculum_start_episode = episode
         q_loss_weight = get_q_loss_weight(episode, q_curriculum_start_episode, config)
         ref_action_dropout_prob = get_ref_action_dropout_prob(q_loss_weight, config)
 
@@ -479,6 +486,17 @@ def train(args):
             )
             log.info(f"  [EVAL] Episode {episode+1} | success_rate={success_rate:.2f}")
 
+            if (
+                not q_curriculum_triggered
+                and success_rate >= args.q_curriculum_start_success_rate
+            ):
+                q_curriculum_start_episode = episode
+                q_curriculum_triggered = True
+                log.info(
+                    f"  [CURRICULUM] Starting Q/dropout curriculum at episode {episode+1} "
+                    f"(eval success_rate={success_rate:.2f} >= {args.q_curriculum_start_success_rate:.2f})"
+                )
+
             if args.wandb:
                 log_payload = {"eval/success_rate": success_rate, "episode": episode}
                 if saved_videos:
@@ -543,6 +561,7 @@ def parse_args():
     p.add_argument("--actor_output_variance", type=float, default=0.1, help="Exploration noise variance added to actor outputs during rollout")
     p.add_argument("--q_loss_weight_max", type=float, default=1.0, help="Maximum weight on the critic term in actor loss")
     p.add_argument("--q_loss_weight_increment", type=float, default=0.1, help="Size of each staircase jump in critic-term weight after first success")
+    p.add_argument("--q_curriculum_start_success_rate", type=float, default=0.3, help="Evaluation success-rate threshold required to start the Q/dropout curriculum")
     p.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate")
     p.add_argument("--actor_lr", type=float, default=3e-4)
