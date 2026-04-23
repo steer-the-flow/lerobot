@@ -51,15 +51,20 @@ class TransformerRLT(nn.Module):
     Encoder-decoder transformer that learns a compact RL token (z_rl) from
     the VLM's final-layer token embeddings.
 
-    Architecture (per the RLT paper):
+    Architecture:
       - ENCODER: takes [z1, ..., zM, e_rl] as input, where z_i are the VLM
         output embeddings for the M input tokens and e_rl is a LEARNED special
         token appended at the END. The encoder output at the <rl> position
         (last position) is z_rl — the information bottleneck.
-      - DECODER: given only z_rl as memory, autoregressively reconstructs the
-        original embeddings [z1, ..., zM] via teacher forcing during training.
-        Because z_rl must retain enough information for full reconstruction,
-        it is forced to be a compressed summary of the entire input.
+      - DECODER: a decoder-only transformer (TransformerEncoder + causal mask).
+        z_rl is prepended as the first token; the model autoregressively
+        reconstructs z from it via self-attention only (no cross-attention).
+        Input:  [z_rl, z_1, ..., z_{M-1}]   (length M+1)
+        Output: [pred_z1, ..., pred_zM, _]   (last position dropped)
+        At position 0 the model only sees z_rl, so it must encode all
+        information needed to predict z_1. At later positions it can also
+        attend to prior reconstructed tokens, but z_rl's influence decays
+        with distance — making this a softer bottleneck than cross-attention.
 
     Changes from the original stub:
       - [FIXED] e_rl shape: was (1, input_classes), now (1, 1, d_model) so it
@@ -69,14 +74,12 @@ class TransformerRLT(nn.Module):
       - [FIXED] Encoder/decoder now use batch_first=True and operate on tensors
         of shape (batch, seq, d_model). The original nn.Transformer used
         seq-first format which was inconsistent with VLM outputs.
-      - [FIXED] Decoder inputs: original code passed src as the query and z_rl
-        as the memory, which is backwards. Now the decoder query is the
-        teacher-forced shifted embeddings [BOS, z1, ..., z_{M-1}] and the
-        memory is z_rl (the bottleneck), with a causal mask for autoregression.
+      - [CHANGED] Decoder is now a decoder-only stack (TransformerEncoder with
+        causal mask) rather than a cross-attention TransformerDecoder. z_rl is
+        prepended to the input sequence instead of passed as memory. No
+        decoder_bos is needed — z_rl seeds the sequence directly.
       - [NEW] input_proj: projects from VLM hidden dimension (e.g. 2048) to
         the RLT's internal d_model before the transformer layers.
-      - [NEW] decoder_bos: a learned beginning-of-sequence token fed as the
-        first decoder input so the model can predict z1 with no prior context.
       - [CHANGED] output_proj: projects decoder outputs back to VLM embedding
         dimension so reconstruction loss is in the same space as the inputs.
     """
@@ -132,7 +135,21 @@ class TransformerRLT(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
 
-        decoder_layer = nn.TransformerDecoderLayer(
+        # [CHANGED] Decoder is now a decoder-only stack (TransformerEncoder + causal
+        # mask) rather than a cross-attention TransformerDecoder.
+        #
+        # z_rl is prepended as the first token in the input sequence instead of
+        # being passed as cross-attention memory. Self-attention with a causal mask
+        # then handles the autoregressive reconstruction:
+        #
+        #   input:  [z_rl, z_1, ..., z_{M-1}]   (length M+1, but we drop the last output)
+        #   target: [z_1,  z_2, ...,  z_M    ]   (length M)
+        #
+        # Position 0 (z_rl) can only attend to itself → must predict z_1 solely from z_rl.
+        # Position i (z_i) can attend to z_rl and z_1..z_i → predicts z_{i+1}.
+        #
+        # No decoder_bos is needed; z_rl itself serves as the sequence seed.
+        decoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_ff,
@@ -140,13 +157,7 @@ class TransformerRLT(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
-
-        # [NEW] Learned beginning-of-sequence token for the decoder.
-        # At decoding step 0 there is no previous embedding, so BOS acts as
-        # the dummy input that allows the model to predict z1.
-        # Shape (1, 1, d_model) broadcasts over batch.
-        self.decoder_bos = nn.Parameter(torch.randn(1, 1, d_model))
+        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=num_decoder_layers)
 
         # Output projection: decoder hidden states -> VLM embedding space.
         self.output_proj = nn.Linear(d_model, input_dim)
@@ -189,27 +200,29 @@ class TransformerRLT(nn.Module):
         enc_out = self.encoder(enc_input)   # (batch, M+1, d_model)
         # [FIXED] Original took enc_out[-1] which is the last *batch* element in
         # seq-first format. Now we index the last *sequence* position correctly.
-        z_rl_mem = enc_out[:, -1:, :]      # (batch, 1, d_model) — kept for cross-attn
-        z_rl = z_rl_mem.squeeze(1)         # (batch, d_model)    — return value
+        z_rl_seq = enc_out[:, -1:, :]      # (batch, 1, d_model) — kept as seq token for decoder
+        z_rl = z_rl_seq.squeeze(1)         # (batch, d_model)    — return value
 
-        # --- 5. Autoregressive decoder: reconstruct z from z_rl ---
-        # Teacher-forcing: shift the target sequence right by one and prepend BOS.
-        #   Decoder input  : [BOS, z_proj_0, ..., z_proj_{M-1}]   length M
-        #   Decoder target : [z_proj_0,  ..., z_proj_{M-1}, z_M]  length M
-        # At step i the decoder sees positions 0..i and must predict position i.
-        bos = self.decoder_bos.expand(batch, -1, -1)             # (batch, 1, d_model)
-        dec_input = torch.cat([bos, z_proj[:, :-1, :]], dim=1)   # (batch, M, d_model)
+        # --- 5. Decoder-only autoregressive reconstruction ---
+        # Input sequence: [z_rl, z_1, ..., z_{M-1}]  length M+1
+        # With a causal mask, position i can only attend to positions 0..i:
+        #   pos 0 (z_rl)      → predicts z_1   (sees only z_rl)
+        #   pos 1 (z_1)       → predicts z_2   (sees z_rl, z_1)
+        #   ...
+        #   pos M-1 (z_{M-1}) → predicts z_M   (sees z_rl, z_1, ..., z_{M-1})
+        #   pos M   (z_M)     → output dropped  (no target at this position)
+        #
+        # We take dec_out[:, :-1, :] to get exactly M predictions aligned with
+        # targets z_1..z_M, discarding the output at position M.
+        dec_input = torch.cat([z_rl_seq, z_proj], dim=1)  # (batch, M+1, d_model)
 
-        # Causal mask: position i can only attend to positions 0..i.
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(M, device=z.device)
+        # Causal mask of size M+1 so each position only attends to prior positions.
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(M + 1, device=z.device)
 
-        # [FIXED] Original passed src as query and z_rl as memory, which reversed
-        # the roles. The correct call: query=dec_input, memory=z_rl_mem (bottleneck).
-        dec_out = self.decoder(
-            tgt=dec_input,
-            memory=z_rl_mem,
-            tgt_mask=tgt_mask,
-        )  # (batch, M, d_model)
+        dec_out = self.decoder(dec_input, mask=causal_mask)  # (batch, M+1, d_model)
+
+        # Drop the output at the last position (z_M has no reconstruction target).
+        dec_out = dec_out[:, :-1, :]  # (batch, M, d_model)
 
         # --- 6. Project decoder output back to VLM embedding dimension ---
         z_recon = self.output_proj(dec_out)  # (batch, M, input_dim)
