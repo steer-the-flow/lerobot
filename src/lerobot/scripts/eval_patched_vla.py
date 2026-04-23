@@ -3,14 +3,22 @@ Verify that patching the Phase 1 action head onto the Phase 2 checkpoint
 produces the same eval performance as the Phase 1 BC baseline.
 TransformerRLT is not used; actions come purely from the VLA.
 """
+import os
+os.environ.setdefault("MUJOCO_GL", "egl")
+
 import argparse
+from pathlib import Path
+
 import torch
+
 from lerobot.envs.metaworld import MetaworldEnv
 from lerobot.envs.utils import preprocess_observation
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.scripts.train_actor_critic_rlt import extract_rl_state_and_vla_ref
 from lerobot.utils.constants import OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
+from lerobot.utils.io_utils import write_video
+
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -31,11 +39,18 @@ def main(args):
     )
     env = MetaworldEnv(task=args.task, obs_type="pixels_agent_pos", render_mode="rgb_array")
 
+    videos_dir = Path(args.video_dir) if args.video_dir else None
+
     successes = 0
     for ep in range(args.n_episodes):
         raw_obs, _ = env.reset()
         vla.reset()
         done = False
+        frames = []
+
+        if ep < args.max_videos:
+            frames.append(env.render())
+
         while not done:
             obs = preprocess_observation(raw_obs)
             obs["task"] = env.task_description
@@ -49,15 +64,25 @@ def main(args):
                 raw_obs, _, terminated, truncated, info = env.step(
                     action_chunk_exec[0, step_i].cpu().numpy()
                 )
+                if ep < args.max_videos:
+                    frames.append(env.render())
                 done = terminated or truncated
                 if done:
                     successes += int(info.get("is_success", False))
                     break
 
-        print(f"Episode {ep+1}/{args.n_episodes} | success={info.get('is_success', False)}")
+        success = info.get("is_success", False)
+        print(f"Episode {ep+1}/{args.n_episodes} | success={success}")
+
+        if ep < args.max_videos and videos_dir is not None and frames:
+            videos_dir.mkdir(parents=True, exist_ok=True)
+            video_path = videos_dir / f"episode_{ep}.mp4"
+            write_video(str(video_path), frames, fps=env.metadata["render_fps"])
+            print(f"  Saved {video_path}")
 
     print(f"\nSuccess rate: {successes}/{args.n_episodes} = {successes/args.n_episodes:.2f}")
     env.close()
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -65,4 +90,6 @@ if __name__ == "__main__":
     p.add_argument("--rlt_checkpoint", required=True)
     p.add_argument("--task", default="peg-insert-side-v3")
     p.add_argument("--n_episodes", type=int, default=20)
+    p.add_argument("--video_dir", default=None, help="Directory to save episode videos")
+    p.add_argument("--max_videos", type=int, default=0, help="Number of episodes to save as video")
     main(p.parse_args())
