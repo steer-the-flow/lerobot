@@ -49,7 +49,7 @@ fi
 
 python src/lerobot/scripts/train_actor_critic_rlt.py \
   --vla_checkpoint=$OCEAN/checkpoints/peg-sft-c10/checkpoints/last/pretrained_model \
-  --rlt_checkpoint=$OCEAN/checkpoints/rlt3/checkpoints/last/pretrained_model \
+  --rlt_checkpoint=$OCEAN/checkpoints/rlt-no-x-attn/checkpoints/last/pretrained_model \
   --output_dir=$OCEAN/checkpoints/$RUN_NAME \
   --total_episodes=$TOTAL_EPISODES \
   --warmup_episodes=$WARMUP_EPISODES \
